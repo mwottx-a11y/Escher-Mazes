@@ -25,7 +25,17 @@ because browsers block ES modules on `file://`.)
 | H | show the way for a few seconds |
 | R / M / Esc | restart level / mute / pause |
 
-On touch screens: drag the left half to walk, the right half to look.
+On phones and tablets: a floating stick under your left thumb walks, your right thumb
+looks, a tap uses an orb, and there are Jump / Hint / Pause buttons. Portrait and
+landscape both work, and the game lowers its own resolution if the device struggles.
+
+### Put it on your home screen
+
+The game is an installable web app (manifest, icons, offline cache). Host the folder
+on any HTTPS static host, for example GitHub Pages: *Settings → Pages → Deploy from a
+branch → this branch, `/ (root)`*. Then open the Pages URL on your phone and choose
+**Add to Home Screen** (Safari: Share menu; Chrome: ⋮ menu). It launches full-screen
+from its own icon and keeps working offline.
 
 **Goal:** collect the golden tribars, then reach the sphere.
 

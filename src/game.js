@@ -9,8 +9,14 @@ import { Sound } from './audio.js';
 
 const $ = (id) => document.getElementById(id);
 const canvas = $('c');
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+const coarse = matchMedia('(pointer: coarse)').matches;
+if (coarse) document.body.classList.add('touch');
+const isTouch = () => document.body.classList.contains('touch');
+const dpr = window.devicePixelRatio || 1;
+// Quality steps down by itself if the device cannot keep up (never back up, to avoid flicker).
+const Q = { scale: Math.min(dpr, coarse ? 1.5 : 2), cap: coarse ? 26 : 48, acc: 0, n: 0, fov: 78 };
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: !(coarse && dpr >= 2), powerPreference: 'high-performance' });
+renderer.setPixelRatio(Q.scale);
 renderer.autoClear = false;
 
 const scene = new THREE.Scene();
@@ -19,7 +25,7 @@ const camera = new THREE.PerspectiveCamera(78, 1, 0.05, 700);
 scene.add(camera);
 const ambient = new THREE.AmbientLight(0xffffff, 2.7);
 scene.add(ambient);
-const lantern = new THREE.PointLight(0xfff0d0, 9, 0, 1.6);
+const lantern = new THREE.PointLight(0xfff0d0, 5, 0, 1.6);
 camera.add(lantern);
 
 const tx = makeTextures();
@@ -229,10 +235,15 @@ function flash() { const f = $('flash'); f.classList.remove('go'); void f.offset
 const overlay = $('overlay'), card = $('card');
 function show(html) { card.innerHTML = html; overlay.hidden = false; card.querySelector('button:not([disabled])')?.focus(); }
 function hideOverlay() { overlay.hidden = true; }
-const controlsHtml = `<div class="keys">
+const keysHtml = `<div class="keys">
   <b>W A S D</b><span>walk (Shift to run)</span><b>Mouse / ← →</b><span>look around</span>
   <b>Space</b><span>jump</span><b>E or click</b><span>use a sun-and-moon orb</span>
   <b>H</b><span>show the way for a moment</span><b>R · M · Esc</b><span>restart · mute · pause</span></div>`;
+const touchHtml = `<div class="keys">
+  <b>Left thumb</b><span>drag anywhere to walk</span><b>Right thumb</b><span>drag to look around</span>
+  <b>Tap</b><span>use a sun-and-moon orb</span><b>Hint</b><span>shows the way for a moment</span></div>
+  <p class="fine">Tip: add this page to your home screen to play full-screen.</p>`;
+const controlsHtml = () => (isTouch() ? touchHtml : keysHtml);
 
 function showMenu() {
   G.mode = 'menu'; $('hud').hidden = true;
@@ -241,15 +252,14 @@ function showMenu() {
     <p>Gather the golden tribars, then reach the sphere. No surface is only a wall: step onto a striped curve and the whole world turns to put it under your feet.</p>
     <div class="rule"></div>
     <button data-level="${Math.min(save.unlocked, LEVELS.length - 1)}">${save.unlocked ? 'Continue' : 'Enter'}</button>
-    <div class="levels">${chips}</div>${controlsHtml}
-    <p class="fine">On a phone or tablet: drag the left half of the screen to walk, the right half to look.</p>`);
+    <div class="levels">${chips}</div>${controlsHtml()}`);
 }
 function showPause() {
   if (G.mode !== 'playing') return;
   G.mode = 'paused';
   show(`<h2>Paused</h2><p class="sub">${G.cfg.name}</p>
     <button data-act="resume">Resume</button><br>
-    <button class="small" data-act="restart">Restart level</button><button class="small" data-act="menu">Menu</button>${controlsHtml}`);
+    <button class="small" data-act="restart">Restart level</button><button class="small" data-act="menu">Menu</button>${controlsHtml()}`);
 }
 function showComplete() {
   G.mode = 'complete'; sound.win(); exitLock();
@@ -274,8 +284,12 @@ function startLevel(i) {
   hideOverlay(); $('hud').hidden = false; G.mode = 'playing';
   lock();
 }
+let wake = null;
+function stayAwake() { try { navigator.wakeLock?.request('screen').then((w) => { wake = w; }).catch(() => {}); } catch { /* optional */ } }
+const buzz = (ms) => { try { navigator.vibrate?.(ms); } catch { /* optional */ } };
 function lock() {
-  if (document.body.classList.contains('touch')) return;
+  stayAwake();
+  if (isTouch()) return;
   try { const p = canvas.requestPointerLock?.(); p?.catch?.(() => {}); } catch { /* sandboxed frame: drag to look instead */ }
 }
 function exitLock() { if (document.pointerLockElement) document.exitPointerLock(); }
@@ -351,7 +365,7 @@ addEventListener('keydown', (e) => {
   if (e.code === 'KeyM') toast(sound.toggleMute() ? 'Sound off' : 'Sound on', 1200);
 });
 addEventListener('keyup', (e) => input.keys.delete(e.code));
-addEventListener('blur', () => input.keys.clear());
+addEventListener('blur', () => { input.keys.clear(); input.moveX = input.moveY = 0; moveId = null; stick.hidden = true; });
 document.addEventListener('pointerlockchange', () => {
   const was = G.locked; G.locked = document.pointerLockElement === canvas;
   if (was && !G.locked && G.mode === 'playing') showPause();
@@ -370,24 +384,49 @@ function look(dx, dy) {
   G.yaw -= dx;
   G.pitch = THREE.MathUtils.clamp(G.pitch - dy, -1.45, 1.45);
 }
-// touch: left half walks, right half looks
-const touches = new Map();
+// touch: a floating stick under the left thumb walks, the right thumb looks, a tap uses an orb
+const touches = new Map(), stick = $('stick'), knob = $('knob'), STICK = 54;
+let moveId = null;
 canvas.addEventListener('touchstart', (e) => {
-  document.body.classList.add('touch'); e.preventDefault();
-  for (const t of e.changedTouches) touches.set(t.identifier, { x0: t.clientX, y0: t.clientY, x: t.clientX, y: t.clientY, move: t.clientX < innerWidth / 2 });
+  if (!isTouch()) { document.body.classList.add('touch'); exitLock(); }
+  e.preventDefault();
+  for (const t of e.changedTouches) {
+    const move = moveId === null && t.clientX < innerWidth * 0.45;
+    touches.set(t.identifier, { x0: t.clientX, y0: t.clientY, x: t.clientX, y: t.clientY, move, t0: performance.now(), far: 0 });
+    if (move) {
+      moveId = t.identifier;
+      stick.style.left = t.clientX + 'px'; stick.style.top = t.clientY + 'px'; knob.style.transform = ''; stick.hidden = false;
+    }
+  }
 }, { passive: false });
 canvas.addEventListener('touchmove', (e) => {
   e.preventDefault();
   for (const t of e.changedTouches) {
     const s = touches.get(t.identifier); if (!s) continue;
-    if (s.move) { input.moveX = THREE.MathUtils.clamp((t.clientX - s.x0) / 50, -1, 1); input.moveY = THREE.MathUtils.clamp((t.clientY - s.y0) / 50, -1, 1); }
-    else if (G.mode === 'playing') look((t.clientX - s.x) * 0.006, (t.clientY - s.y) * 0.006);
+    if (s.move) {
+      let dx = t.clientX - s.x0, dy = t.clientY - s.y0; const len = Math.hypot(dx, dy);
+      if (len > STICK) { dx *= STICK / len; dy *= STICK / len; }
+      knob.style.transform = `translate(${dx}px, ${dy}px)`;
+      const dead = len < 9 ? 0 : 1;
+      input.moveX = dead * dx / STICK; input.moveY = dead * dy / STICK;
+    } else {
+      s.far += Math.abs(t.clientX - s.x) + Math.abs(t.clientY - s.y);
+      if (G.mode === 'playing') look((t.clientX - s.x) * 0.0052, (t.clientY - s.y) * 0.0052);
+    }
     s.x = t.clientX; s.y = t.clientY;
   }
 }, { passive: false });
-const touchEnd = (e) => { for (const t of e.changedTouches) { if (touches.get(t.identifier)?.move) input.moveX = input.moveY = 0; touches.delete(t.identifier); } };
+const touchEnd = (e) => {
+  for (const t of e.changedTouches) {
+    const s = touches.get(t.identifier); if (!s) continue;
+    if (s.move) { input.moveX = input.moveY = 0; moveId = null; stick.hidden = true; }
+    else if (s.far < 10 && performance.now() - s.t0 < 320) useOrb();
+    touches.delete(t.identifier);
+  }
+};
 canvas.addEventListener('touchend', touchEnd); canvas.addEventListener('touchcancel', touchEnd);
-$('touch').addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) act(b.dataset.act); });
+$('touch').addEventListener('pointerdown', (e) => { const b = e.target.closest('button'); if (b) { e.preventDefault(); act(b.dataset.act); } });
+addEventListener('contextmenu', (e) => e.preventDefault());
 
 // --- simulation ------------------------------------------------------------
 const fwd = new THREE.Vector3(), right = new THREE.Vector3(), tmpM = new THREE.Matrix4(), tmpQ = new THREE.Quaternion();
@@ -413,7 +452,7 @@ function update(dt) {
     pl.flip = null; G.flips++;
     if (G.idx === 0 && G.flips === 1) toast('The wall is your floor now. The cube in the corner shows which way the world has turned.', 6000);
   }
-  if (pl.trans && pl.trans.u < 0.03 && !pl.trans.sounded) { pl.trans.sounded = true; sound.flip(); }
+  if (pl.trans && pl.trans.u < 0.03 && !pl.trans.sounded) { pl.trans.sounded = true; sound.flip(); buzz(25); }
   if (pl.landed) { sound.land(pl.landed); pl.landed = 0; }
   if (pl.walked - G.lastStep > 2.3) { G.lastStep = pl.walked; sound.step(); }
   if (pl.grounded && !pl.trans && pl.walked - G.lastPrint > 1.25) { G.lastPrint = pl.walked; footprint(); }
@@ -421,7 +460,7 @@ function update(dt) {
   // pickups
   const c = cellOf(pl, level), d = Math.hypot(...delta(level, eyeArr(), level.center(c)));
   if (G.keysLeft.has(c) && d < 1.3) {
-    G.keysLeft.delete(c); world.remove(G.keyObjs.get(c)); sound.key(); updateHud();
+    G.keysLeft.delete(c); world.remove(G.keyObjs.get(c)); sound.key(); buzz([15, 40, 15]); updateHud();
     toast(G.keysLeft.size ? `Tribar found. ${G.keysLeft.size} to go.` : 'All tribars found. The sphere is awake: find it.', 3500);
   }
   if (c === level.exit && d < 1.5) {
@@ -429,7 +468,7 @@ function update(dt) {
     else if (!G.exitWarned) { G.exitWarned = true; sound.deny(); toast(`The sphere sleeps. ${G.keysLeft.size} tribar${G.keysLeft.size > 1 ? 's' : ''} still to find.`); }
   } else G.exitWarned = false;
   $('prompt').classList.toggle('on', nearOrb());
-  if (nearOrb()) $('prompt').textContent = document.body.classList.contains('touch') ? 'Tap Use to turn day into night' : 'Press E to turn day into night';
+  if (nearOrb()) $('prompt').textContent = isTouch() ? 'Tap to turn day into night' : 'Press E to turn day into night';
   if (Math.floor(G.time) !== Math.floor(G.time - dt)) updateHud();
 }
 
@@ -485,7 +524,7 @@ function render() {
     const bob = pl.grounded && !pl.trans ? Math.sin(pl.walked * 2.7) * 0.035 : 0;
     G.bob += (bob - G.bob) * 0.3;
     camera.position.copy(V(pl.pos)).addScaledVector(up, EYE + G.bob);
-    camera.fov = 78 + (pl.trans ? Math.sin(pl.trans.u * Math.PI) * 9 : 0);
+    camera.fov = Q.fov + (pl.trans ? Math.sin(pl.trans.u * Math.PI) * 9 : 0);
     camera.updateProjectionMatrix();
     sky.position.copy(camera.position);
 
@@ -504,7 +543,7 @@ function render() {
         if (dist > far || !frustum.intersectsBox(box)) continue;
         list.push([dist, i, j, k]);
       }
-      list.sort((a, b) => a[0] - b[0]); list.length = Math.min(list.length, 48);
+      list.sort((a, b) => a[0] - b[0]); list.length = Math.min(list.length, Q.cap);
       for (const [, i, j, k] of list) {
         world.position.set(i * sz[0], j * sz[1], k * sz[2]);
         avatar.visible = !!(i || j || k);
@@ -514,9 +553,11 @@ function render() {
     }
 
     // orientation cube
-    const gs = Math.round(Math.min(120, w * 0.22));
+    // (on touch screens it sits under the clock, out of the way of the thumbs)
+    const touch = isTouch(), gs = Math.round(touch ? 78 : Math.min(120, w * 0.22));
+    const gx = w - gs - 6 - safe.r, gy = touch ? h - gs - 62 - safe.t : 6;
     renderer.clearDepth(); renderer.setScissorTest(true);
-    renderer.setScissor(w - gs - 6, 6, gs, gs); renderer.setViewport(w - gs - 6, 6, gs, gs);
+    renderer.setScissor(gx, gy, gs, gs); renderer.setViewport(gx, gy, gs, gs);
     gizmo.quaternion.copy(camera.quaternion).invert();
     const gd = pl.trans ? V(DIRS[pl.trans.f]).lerp(V(DIRS[pl.trans.w]), pl.trans.u).normalize() : V(DIRS[pl.g]);
     gizmoWeight.position.copy(gd).multiplyScalar(0.95);
@@ -524,15 +565,31 @@ function render() {
   }
 }
 
+const safe = { t: 0, r: 0 };
 function resize() {
   renderer.setSize(innerWidth, innerHeight, false);
-  camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+  const aspect = innerWidth / innerHeight;
+  camera.aspect = aspect;
+  // In portrait keep a usable horizontal view instead of a keyhole.
+  Q.fov = aspect >= 1 ? 78 : Math.min(104, THREE.MathUtils.radToDeg(2 * Math.atan(Math.tan(THREE.MathUtils.degToRad(33)) / aspect)));
+  camera.updateProjectionMatrix();
+  const cs = getComputedStyle(document.documentElement);
+  safe.t = parseFloat(cs.getPropertyValue('--sat')) || 0; safe.r = parseFloat(cs.getPropertyValue('--sar')) || 0;
 }
-addEventListener('resize', resize); resize();
+addEventListener('resize', resize); addEventListener('orientationchange', () => setTimeout(resize, 250)); resize();
+function lowerQuality() {
+  if (Q.scale <= 0.75 && Q.cap <= 12) return;
+  Q.scale = Math.max(0.75, Q.scale * 0.8); Q.cap = Math.max(12, Math.floor(Q.cap * 0.75));
+  renderer.setPixelRatio(Q.scale); resize();
+}
 
 let last = performance.now();
 function frame(now) {
-  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  const raw = (now - last) / 1000, dt = Math.min(0.05, raw); last = now;
+  if (G.mode === 'playing' && raw < 0.5 && G.time > 1.5) {
+    Q.acc += raw;
+    if (++Q.n >= 50) { if (Q.acc / Q.n > 1 / 36) lowerQuality(); Q.acc = Q.n = 0; }
+  }
   if (G.mode === 'playing') update(dt);
   else if (G.mode === 'menu') G.yaw += dt * 0.12;
   animate(dt);
@@ -548,3 +605,5 @@ requestAnimationFrame(frame);
 addEventListener('visibilitychange', () => { if (document.hidden && G.mode === 'playing') { exitLock(); showPause(); } });
 
 window.__escher = { G, tick: update, startLevel, showHint, useOrb, input, frame: (dt) => { update(dt); animate(dt); render(); } };
+
+if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('./sw.js').catch(() => {});
